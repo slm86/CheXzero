@@ -32,7 +32,7 @@ def preprocess(img, desired_size=320):
     old_size = img.size
     ratio = float(desired_size)/max(old_size)
     new_size = tuple([int(x*ratio) for x in old_size])
-    img = img.resize(new_size, Image.ANTIALIAS)
+    img = img.resize(new_size, Image.Resampling.LANCZOS)
     # create a new image and paste the resized on it
 
     new_img = Image.new('L', (desired_size, desired_size))
