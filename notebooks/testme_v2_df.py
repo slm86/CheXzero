@@ -8,7 +8,11 @@ import sys
 sys.path.append('/p/project/ccstdl/moroianu1/chexzero_main/CheXzero/')
 
 from eval import evaluate, bootstrap
-from zero_shot import make, make_true_labels, run_softmax_eval
+from zero_shot import make_true_labels, run_softmax_eval, CXRTestDataset
+
+import open_clip
+import torch
+from torchvision.transforms import Compose, Normalize, Resize, InterpolationMode
 
 ## Define Zero Shot Labels and Templates
 
@@ -42,7 +46,54 @@ for subdir, dirs, files in os.walk(model_dir):
         full_dir = os.path.join(subdir, file)
         model_paths.append(full_dir)
 # TODO: manually place here model path you want e.g. model_paths = ['path1.pt']    
-print(model_paths)
+checkpoint_folder = '/p/project/ccstdl/moroianu1/open_clip_main/logs/2024_02_20-02_11_31-model_ViT-B-32-lr_0.001-b_512-j_4-p_amp/checkpoints/'
+
+def make(
+    model_path: str, 
+    cxr_filepath: str, 
+    pretrained: bool = True, 
+    context_length: bool = 77, 
+):
+    """
+    FUNCTION: make
+    -------------------------------------------
+    This function makes the model, the data loader, and the ground truth labels. 
+    
+    args: 
+        * model_path - String for directory to the weights of the trained clip model. 
+        * context_length - int, max number of tokens of text inputted into the model. 
+        * cxr_filepath - String for path to the chest x-ray images. 
+        * cxr_labels - Python list of labels for a specific zero-shot task. (i.e. ['Atelectasis',...])
+        * pretrained - bool, whether or not model uses pretrained clip weights
+        * cutlabels - bool, if True, will keep columns of ground truth labels that correspond
+        with the labels inputted through `cxr_labels`. Otherwise, drop the first column and keep remaining.
+    
+    Returns model, data loader. 
+    """
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # load model
+    model, _, preprocess = open_clip.create_model_and_transforms('ViT-B-32', pretrained=model_path)
+    model = model.to(device) 
+    # load data
+    transformations = [
+        # means computed from sample in `cxr_stats` notebook
+        Normalize((101.48761, 101.48761, 101.48761), (83.43944, 83.43944, 83.43944)),
+    ]
+    # if using CLIP pretrained model
+    if pretrained: 
+        # resize to input resolution of pretrained clip model
+        input_resolution = 224
+        transformations.append(Resize(input_resolution, interpolation=InterpolationMode.BICUBIC))
+    transform = Compose(transformations)
+    
+    # create dataset
+    torch_dset = CXRTestDataset(
+        img_path=cxr_filepath,
+        transform=transform, 
+    )
+    loader = torch.utils.data.DataLoader(torch_dset, shuffle=False)
+    
+    return model, loader
 
 ## Run the model on the data set using ensembled models
 def ensemble_models(
@@ -96,28 +147,40 @@ def ensemble_models(
     
     return predictions, y_pred_avg
 
-predictions, y_pred_avg = ensemble_models(
-    model_paths=model_paths, 
-    cxr_filepath=cxr_filepath, 
-    cxr_labels=cxr_labels, 
-    cxr_pair_template=cxr_pair_template, 
-    cache_dir=cache_dir,
-)
+results_df = pd.DataFrame()
+print('Number epochs:',len(os.listdir(checkpoint_folder))-1)
+n_epochs = len(os.listdir(checkpoint_folder))-1
+for ep in range(1,1+n_epochs):
+    checkpoint = os.path.join(checkpoint_folder, 'epoch_'+str(ep)+'.pt')
+    model_paths = [checkpoint]
 
-# save averaged preds
-pred_name = "chexpert_preds.npy" # add name of preds
-predictions_dir = predictions_dir / pred_name
-np.save(file=predictions_dir, arr=y_pred_avg)
+    predictions, y_pred_avg = ensemble_models(
+        model_paths=model_paths, 
+        cxr_filepath=cxr_filepath, 
+        cxr_labels=cxr_labels, 
+        cxr_pair_template=cxr_pair_template, 
+        cache_dir=cache_dir,
+        save_name='mimic-epoch-'+str(ep)
+    )
 
-# make test_true
-test_pred = y_pred_avg
-test_true = make_true_labels(cxr_true_labels_path=cxr_true_labels_path, cxr_labels=cxr_labels)
+    # # save averaged preds
+    # pred_name = "chexpert_preds.npy" # add name of preds
+    # predictions_dir = predictions_dir / pred_name
+    # np.save(file=predictions_dir, arr=y_pred_avg)
 
-# evaluate model
-cxr_results = evaluate(test_pred, test_true, cxr_labels)
-print(cxr_results)
+    # make test_true
+    test_pred = y_pred_avg
+    test_true = make_true_labels(cxr_true_labels_path=cxr_true_labels_path, cxr_labels=cxr_labels)
 
-# boostrap evaluations for 95% confidence intervals
-bootstrap_results = bootstrap(test_pred, test_true, cxr_labels)
+    # evaluate model
+    cxr_results = evaluate(test_pred, test_true, cxr_labels)
 
-print(bootstrap_results[1])
+    cxr_results['epoch'] = ep
+
+    results_df = pd.concat([results_df,cxr_results], ignore_index=True)
+    # # boostrap evaluations for 95% confidence intervals
+    # bootstrap_results = bootstrap(test_pred, test_true, cxr_labels)
+
+    # print(bootstrap_results[1])
+print(results_df)
+results_df.to_csv('testme_v2_plot.csv')
